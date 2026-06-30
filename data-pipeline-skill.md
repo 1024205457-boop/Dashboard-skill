@@ -317,3 +317,326 @@ AI 可以识别 cookie 过期的信号（HTTP 状态码、返回空数据、"未
 
 黄金法则：AI 永远不假设，只报告和等待确认。
 ```
+
+---
+---
+
+# AI-Driven Weekly Data Update Workflow — Design Methodology
+
+## Overview
+
+This document summarizes the design methodology for an AI (Claude Code) assisted weekly data collection, processing, and Excel writing workflow. Core philosophy: **AI is the intern, the human is the mentor** — AI handles mechanical execution and preliminary validation, while the human handles business judgment and final confirmation.
+
+---
+
+## 1. Workflow Architecture
+
+### Layered Pipeline (6 Steps)
+
+```
+update-all.sh
+├── Step 1: Verify previous week's data (verify-prev-week.py)
+├── Step 2: Collect current week's data (5 fetch scripts in parallel)
+├── Step 3: Mario async tasks (submit + poll + download CSV)
+├── Step 4: Collect 4-week rolling data (fetch-4week.js)
+├── Step 5: Write current week Excel (write-weekly.py)
+└── Step 6: Write 4-week Excel (write-4week.py)
+```
+
+### Design Principles
+
+1. **Separation of collection and writing**: Fetch scripts only output JSON/CSV to `input/`; write scripts only read `input/` and write to `output/`. Intermediate state is inspectable and re-runnable.
+2. **Idempotency**: Same parameters produce the same result. Writes locate target rows/columns first and overwrite rather than append.
+3. **Parallel without dependencies**: 5 fetch scripts are independent and run in parallel. Mario async task submission doesn't block other collection.
+4. **Verify before writing**: Step 1 validates previous week's data integrity; aborts on anomalies.
+5. **Minimal write scope**: The 4-week script only writes new BI data for the current week; historical weeks retain existing Excel values.
+
+### Why Not One Big Script
+
+- Allows single-step re-runs during debugging (only re-run the failed step)
+- Different steps fail for different reasons (cookie expiry vs API timeout vs formula errors)
+- AI can precisely locate the problem module without affecting others
+
+---
+
+## 2. How to Write Prompts
+
+### Instruction Structure for AI
+
+```
+1. Clear objective: "Update the four main tables + OKR for week 0608"
+2. Constraints: "Refresh cookie first" "Don't write if 21-day observation period incomplete"
+3. Validation criteria: "After completion, compare with last week; report if WoW change exceeds 50%"
+4. Error handling: "If BI query returns null, retry 3 times"
+```
+
+### Key Principles
+
+| Principle | Explanation | Anti-pattern |
+|-----------|-------------|--------------|
+| Give formulas, not conclusions | Tell AI "conversion rate = conversion_uv / add_friend_uv" | Don't say "about 4%~6%" |
+| Give boundaries, not freedom | "col14=conversion/add_friend, col15=conversion/activation, col16=conversion/class_attendance" | Don't say "calculate the conversion rates" |
+| Give validation, not trust | "Read back after writing to verify values match" | Don't say "just write it" |
+| Give sources, not guesses | "Pool add_friend = BI query (emonTagName=new_user+mini_program)" | Don't say "find the add_friend data yourself" |
+
+### Common Prompt Pitfalls
+
+- **"Update it"** → AI might only update current week, ignoring 4-week rolling. Should specify "four tables + OKR, including 4-week rolling"
+- **"Calculate the conversion rate"** → AI might use wrong denominator. Should write "rate = A/B, where A comes from field X, B comes from field Y"
+- **"The data is wrong, check it"** → AI will guess randomly. Should provide "last week's actual value is X, you wrote Y, the discrepancy is in Z"
+
+---
+
+## 3. Role of Each Step & AI Capability Boundaries
+
+### Step 1: Verify Previous Week Data
+
+| Task | AI does | Human does |
+|------|---------|------------|
+| Read existing Excel data | ✅ | |
+| Compare against JSON source data | ✅ | |
+| Detect numerical discrepancies | ✅ | |
+| Judge whether discrepancy is acceptable (e.g., 21-day observation period not yet complete) | | ✅ |
+| Decide whether to overwrite and correct | | ✅ |
+
+### Step 2: Collect Current Week Data
+
+| Task | AI does | Human does |
+|------|---------|------------|
+| Execute fetch scripts | ✅ | |
+| Check returned data is non-empty | ✅ | |
+| Detect cookie expiry and trigger refresh | ✅ (runs refresh script) | ✅ (scans QR code) |
+| Judge if data magnitude is reasonable | ✅ (compare to last week) | ✅ (final confirmation) |
+| Judge why data dropped | ⚠️ (provide hypothesis) | ✅ (confirm the reason) |
+
+### Step 3: Mario Async Tasks
+
+| Task | AI does | Human does |
+|------|---------|------------|
+| Submit Mario SQL tasks | ✅ | |
+| Poll until completion | ✅ | |
+| Validate paramsValue match (prevent downloading stale records) | ✅ | |
+| Parse CSV (filter for 21-day rows) | ✅ | |
+| Judge whether Mario SQL logic is correct | | ✅ |
+
+### Step 4-6: Data Writing
+
+| Task | AI does | Human does |
+|------|---------|------------|
+| Calculate metrics by formula | ✅ | |
+| Write to specified Excel cells | ✅ | |
+| Fix historical formulas after insert_cols | ✅ | |
+| Confirm whether to write incomplete data | | ✅ |
+| Confirm whether to write anomalous values (e.g., -80% WoW) | | ✅ |
+
+---
+
+## 4. What AI MUST Do (Non-Negotiable)
+
+### 1. Confirm Data Completeness Before Writing
+
+```
+If data doesn't cover 7 days (Monday to Sunday), must ask user:
+"This week's data only goes to [date], missing N days. Proceed with writing?"
+```
+
+**Lesson learned**: Once wrote incomplete mid-week data directly. Group-buy users showed 1,264 (actual was 3,930). All metrics were severely low.
+
+### 2. Mario CSV Must Filter by Observation Period
+
+```javascript
+// Each combination has 3 rows (7-day/14-day/21-day), only take 21-day
+if (row[observationField] === '21日') { ... }
+```
+
+**Lesson learned**: Without filtering, purchase user counts are 3x overcounted.
+
+### 3. Mario Polling Must Validate Parameter Match
+
+```javascript
+function isMatchingRecord(rec) {
+  const params = rec.paramsValue || '';
+  return params.includes(START) && params.includes(END);
+}
+```
+
+**Lesson learned**: `marioLatestQuery` may return old successful records (different date range), causing missing data for certain weeks.
+
+### 4. Fix Historical Formulas After insert_cols
+
+```python
+# openpyxl insert_cols does NOT update formula references in shifted columns
+fix_formulas_after_insert(ws, insert_col, max_row, max_col)
+```
+
+**Lesson learned**: Without fixing, "this week and last week have the same churn rate."
+
+### 5. Formula Denominators Must Be Explicitly Specified
+
+```python
+# Different conversion rates have different denominators!
+col14 = conversion_uv / add_friend_uv    # Add-friend conversion rate
+col15 = conversion_uv / activation_uv    # UV conversion rate
+col16 = conversion_uv / class_attendance_uv  # Class-attendance conversion rate
+```
+
+**Lesson learned**: All three columns used the same denominator (claim_uv), resulting in three identical rates.
+
+### 6. Pipe Chart API Multi-Series Aggregation
+
+```javascript
+// When filtering multiple user_types, API returns multiple series
+// Must aggregate by name, cannot just take series[0]
+for (const s of series) {
+  if (s.name.includes('order_uv')) orderUv += sumSeries(s);
+  if (s.name.includes('conversion_uv')) conversionUv += sumSeries(s);
+}
+```
+
+### 7. BI Query Null Retry
+
+BI API occasionally returns null (server-side cache not ready). Must auto-retry 2-3 times with 3-second intervals.
+
+---
+
+## 5. What AI Must NEVER Do
+
+### 1. Never Guess API Parameters
+
+- Pipe selects: each position represents a different filter dimension; must be specified by the human or captured from network requests
+- Mario SQL template IDs and paramsValue format must be exact — no "close enough"
+- BI query template is 138KB; field names, filter conditions, and date formats must strictly match the template
+
+### 2. Never Skip Verification and Write Directly
+
+Even if last run succeeded, this run must still:
+- Check if cookie has expired (expires roughly weekly)
+- Check if data covers a complete week
+- Compare to last week's data; report anomalous WoW changes
+
+### 3. Never Unilaterally Decide "Data Looks Normal"
+
+AI can report "This week's small-course orders: 3,627; last week: 6,337; WoW: -42.8%", but cannot independently judge whether this is acceptable. Possible causes:
+- Push notifications stopped (business decision)
+- 21-day observation period incomplete (normal)
+- Cookie expired causing empty collection (bug)
+
+These require human judgment.
+
+### 4. Never Assume Column Structure Is Unchanged
+
+Excel columns may be manually adjusted at any time. Before every write:
+- Confirm target sheet and row/column positions
+- Locate by header or date, never hardcode row numbers
+
+### 5. Never Use Wrong Time Ranges
+
+- Current week data: Monday~Sunday (7 days)
+- 4-week rolling: the most recent 4 complete weeks
+- 21-day observation period: weekEnd + 21 days before the 21-day conversion data is valid
+- Renewal conversion rate "observation week" ≠ current week; it's the complete week found by subtracting 21 days from current week
+
+### 6. Never Get Stuck at the Same Point More Than 3 Times
+
+When the same error keeps recurring (e.g., Playwright version mismatch, API persistent 502), immediately inform the user and ask for help. Don't keep hammering.
+
+---
+
+## 6. Anomaly Detection & Reporting Template
+
+After completing data writes, AI should generate a report in this format:
+
+```
+===== Weekly Data Update Report (2026-06-15) =====
+
+Normal metrics:
+  Group-buy users: 3,842 (last week 4,012, WoW -4.2%) ✅
+  WeCom friend adds: 1,523 (last week 1,491, WoW +2.1%) ✅
+
+Anomalous metrics (WoW change >30%):
+  ⚠️ Small-course orders: 3,627 (last week 6,337, WoW -42.8%)
+  ⚠️ bkqw-new users: 297 (last week 1,194, WoW -75.1%)
+
+Pending confirmation:
+  - Weeks with incomplete 21-day observation: 0608, 0615 (low conversion data is normal)
+  - Pool add-friend: BI returned null, retry succeeded, final value 523
+
+Operations:
+  [x] Cookie refresh
+  [x] 5 fetch scripts completed
+  [x] Mario 27717/28543 tasks completed and downloaded
+  [x] write-weekly.py completed
+  [x] write-4week.py completed
+```
+
+---
+
+## 7. Cookie Management Strategy
+
+```
+Cookies expire approximately weekly. Flow:
+1. Refresh with refresh-cookie.js before updates
+2. Script launches Playwright and opens login page
+3. Human scans QR code (the only manual intervention point)
+4. Script automatically saves pipe-cookie.txt / emon-cookie.txt / bi-cookie.txt
+5. If any fetch returns 401/403 mid-run, cookie has expired — need to re-refresh
+```
+
+AI can recognize cookie expiry signals (HTTP status codes, empty data returns, "not logged in" error messages), but cannot complete QR code login automatically.
+
+---
+
+## 8. Data Source to Metric Mapping (Core Knowledge)
+
+| Metric | Data Source | Key Considerations |
+|--------|-------------|-------------------|
+| Group-buy/New users/Card types | Pipe chart/detail API | Each position in selects has different meaning |
+| Conversion funnel | Mario 26833 CSV | Takes several minutes to complete |
+| Traffic pool metrics | Pipe API (chart) | Claim/activation/class/completion/conversion each has different denominator |
+| Tencent-z/Distribution conversion | Mario 28543 CSV + BI add-friend | CSV filter 21-day + BI QR-code name exact match |
+| Trial channel conversion share | Mario 27717 CSV | Same as above, must filter 21-day |
+| WeCom friend add/churn | Emon API | groupIds=[1,75,428,949] |
+| WeChat Official Account followers | WeChat MP API | Requires mp-cookie + mp-token |
+| Traffic pool add-friend | BI query | emonTagName=new_user+mini_program, NOT biChannels total |
+
+---
+
+## 9. Workflow Evolution Principles
+
+### When to Add New Scripts vs Modify Existing
+
+- **New metric, new data source** → New script (e.g., fetch-okr.js)
+- **New filter on same data source** → Add parameters to existing fetch script
+- **Write target changed** → Modify write script, leave fetch alone
+
+### When to Automate vs Keep Manual
+
+- **Mechanical repetition, no judgment needed** → Automate (fetch + write)
+- **Requires business judgment** → Manual confirmation point (e.g., whether to write anomalous data)
+- **One-off operation** → Temporary script (tmp-*.js), not in main flow
+
+### How to Safely Modify Calculation Logic
+
+1. Read current code first, understand existing logic
+2. Clearly identify the formula and position to change
+3. After modification, validate with known data (re-run write with last week's input JSON, compare Excel output)
+4. Don't "optimize" unrelated code along the way
+
+---
+
+## 10. Summary: Golden Rules of Human-AI Collaboration
+
+```
+              AI's Responsibilities                    Human's Responsibilities
+┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
+│ Execute collection scripts           │  │ QR code login (cookie refresh)      │
+│ Calculate metrics by formula         │  │ Confirm if anomalous data is valid  │
+│ Write to specified Excel positions   │  │ Judge business reasons (push stopped?) │
+│ Detect WoW anomalies and report      │  │ Decide whether to write incomplete data │
+│ Retry failed API calls               │  │ Provide formulas and sources for new metrics │
+│ Validate Mario parameter matching    │  │ Final review of written results     │
+│ Fix formula reference offsets        │  │ Specify API parameter meanings      │
+└─────────────────────────────────────┘  └─────────────────────────────────────┘
+
+Golden Rule: AI never assumes — it only reports and waits for confirmation.
+```
